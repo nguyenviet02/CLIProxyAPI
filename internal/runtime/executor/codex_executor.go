@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -176,22 +177,27 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}
 
 	lines := bytes.Split(data, []byte("\n"))
-	for _, line := range lines {
-		if !bytes.HasPrefix(line, dataTag) {
+	var ssePayloads [][]byte
+	for _, rawLine := range lines {
+		if !bytes.HasPrefix(rawLine, dataTag) {
 			continue
 		}
-
-		line = bytes.TrimSpace(line[5:])
+		line := bytes.TrimSpace(rawLine[5:])
+		if len(line) == 0 {
+			continue
+		}
+		ssePayloads = append(ssePayloads, bytes.Clone(line))
 		if gjson.GetBytes(line, "type").String() != "response.completed" {
 			continue
 		}
 
-		if detail, ok := parseCodexUsage(line); ok {
+		completedLine := rebuildCodexCompletedOutput(line, ssePayloads)
+		if detail, ok := parseCodexUsage(completedLine); ok {
 			reporter.publish(ctx, detail)
 		}
 
 		var param any
-		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, line, &param)
+		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, completedLine, &param)
 		resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 		return resp, nil
 	}
@@ -736,6 +742,49 @@ func codexCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 		}
 	}
 	return
+}
+
+func rebuildCodexCompletedOutput(completedLine []byte, ssePayloads [][]byte) []byte {
+	if gjson.GetBytes(completedLine, "type").String() != "response.completed" {
+		return completedLine
+	}
+	if gjson.GetBytes(completedLine, "response.output.#").Int() > 0 {
+		return completedLine
+	}
+
+	itemsByIndex := map[int][]gjson.Result{}
+	for _, payload := range ssePayloads {
+		if gjson.GetBytes(payload, "type").String() != "response.output_item.done" {
+			continue
+		}
+		item := gjson.GetBytes(payload, "item")
+		if !item.Exists() {
+			continue
+		}
+		idx := int(gjson.GetBytes(payload, "output_index").Int())
+		itemsByIndex[idx] = append(itemsByIndex[idx], item)
+	}
+	if len(itemsByIndex) == 0 {
+		return completedLine
+	}
+
+	idxs := make([]int, 0, len(itemsByIndex))
+	for idx := range itemsByIndex {
+		idxs = append(idxs, idx)
+	}
+	sort.Ints(idxs)
+
+	updated := completedLine
+	for _, idx := range idxs {
+		for _, item := range itemsByIndex[idx] {
+			var err error
+			updated, err = sjson.SetRawBytes(updated, "response.output.-1", []byte(item.Raw))
+			if err != nil {
+				return completedLine
+			}
+		}
+	}
+	return updated
 }
 
 func (e *CodexExecutor) resolveCodexConfig(auth *cliproxyauth.Auth) *config.CodexKey {
