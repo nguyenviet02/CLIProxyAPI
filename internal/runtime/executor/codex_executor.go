@@ -166,6 +166,15 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}
 	appendAPIResponseChunk(ctx, e.cfg, data)
 
+	trimmed := bytes.TrimSpace(data)
+	if gjson.GetBytes(trimmed, "object").String() == "response" {
+		reporter.publish(ctx, parseOpenAIUsage(trimmed))
+		var param any
+		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, trimmed, &param)
+		resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
+		return resp, nil
+	}
+
 	lines := bytes.Split(data, []byte("\n"))
 	for _, line := range lines {
 		if !bytes.HasPrefix(line, dataTag) {
